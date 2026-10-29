@@ -83,7 +83,30 @@ This rule is intentionally narrow: it matches `interface_protocol == 0` and HID 
 
 ## Validating device enumeration without creating credentials
 
-zig-ctap2 exposes a count-only entry point that opens each FIDO interface, sends nothing, and returns immediately. It is the right thing to call from a smoke test because it surfaces `CTAP2_ERR_NOT_ACCESSIBLE` without touching the credential store on the key:
+The Zig API is the clearest way to smoke-test enumeration, because `hid.enumerate` returns `error.DevicesNotAccessible` when FIDO devices are present but cannot be opened. It opens each FIDO interface, sends nothing, and returns immediately:
+
+```zig
+const std = @import("std");
+const ctap2 = @import("zig-ctap2");
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+    const devices = ctap2.hid.enumerate(allocator) catch |err| switch (err) {
+        error.DevicesNotAccessible => {
+            std.debug.print("FIDO devices present but not accessible -- check udev rules\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer {
+        for (devices) |*dev| dev.close();
+        allocator.free(devices);
+    }
+    std.debug.print("Found {d} FIDO devices\n", .{devices.len});
+}
+```
+
+From C, `ctap2_device_count()` returns `0` for any enumeration error, so a permission problem looks the same as an empty bus. When it returns `0`, `ctap2_get_info()` tells the two apart: it returns `CTAP2_ERR_NOT_ACCESSIBLE` (`-11`) when devices exist but cannot be opened. `getInfo` needs no PIN and no touch, and does not change state on the authenticator.
 
 ```c
 #include "ctap2.h"
@@ -91,39 +114,21 @@ zig-ctap2 exposes a count-only entry point that opens each FIDO interface, sends
 
 int main(void) {
     int count = ctap2_device_count();
-    if (count == -11) {
+    if (count > 0) {
+        printf("Found %d FIDO devices\n", count);
+        return 0;
+    }
+    unsigned char buf[1024];
+    if (ctap2_get_info(buf, sizeof buf) == CTAP2_ERR_NOT_ACCESSIBLE) {
         fprintf(stderr, "FIDO devices present but not accessible -- check udev rules\n");
-        return 1;
+    } else {
+        fprintf(stderr, "No FIDO devices found\n");
     }
-    if (count < 0) {
-        fprintf(stderr, "ctap2_device_count failed: %d\n", count);
-        return 1;
-    }
-    printf("Found %d FIDO devices\n", count);
-    return 0;
+    return 1;
 }
 ```
 
-From Zig:
-
-```zig
-const ctap2 = @import("zig-ctap2");
-
-pub fn main() !void {
-    var allocator = std.heap.page_allocator;
-    const devices = ctap2.hid_linux.enumerate(allocator) catch |err| switch (err) {
-        error.DevicesNotAccessible => {
-            std.debug.print("FIDO devices present but not accessible -- check udev rules\n", .{});
-            return;
-        },
-        else => return err,
-    };
-    defer allocator.free(devices);
-    std.debug.print("Found {d} FIDO devices\n", .{devices.len});
-}
-```
-
-Neither call sends a `getInfo`, `makeCredential`, or `getAssertion` to the device, so there is no PIN prompt, no user presence touch, and no risk of dirtying state on the authenticator. A run that prints `Found N FIDO devices` with `N >= 1` confirms the udev path is working end to end.
+Neither path sends `makeCredential` or `getAssertion`, so there is no PIN prompt, no user presence touch, and no risk of dirtying state on the authenticator. A run that prints `Found N FIDO devices` with `N >= 1` confirms the udev path is working end to end.
 
 ## Common gotchas
 
